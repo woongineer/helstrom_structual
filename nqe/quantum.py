@@ -2,15 +2,22 @@ from itertools import combinations
 
 import numpy as np
 import torch
+from torch import nn
 
 
-R = torch.float64
-C = torch.complex128
-I = torch.eye(2, dtype=C)
-X = torch.tensor([[0, 1], [1, 0]], dtype=C)
-Y = torch.tensor([[0, -1j], [1j, 0]], dtype=C)
-Z = torch.tensor([[1, 0], [0, -1]], dtype=C)
-H = torch.tensor([[1, 1], [1, -1]], dtype=C) / np.sqrt(2)
+Z = torch.tensor([[1, 0], [0, -1]], dtype=torch.complex128)
+H = torch.tensor([[1, 1], [1, -1]], dtype=torch.complex128) / np.sqrt(2)
+PAIRS = [(0, 1), (1, 2), (2, 3), (3, 0)]
+
+
+def network():
+    return nn.Sequential(
+        nn.Linear(4, 8),
+        nn.ReLU(),
+        nn.Linear(8, 8),
+        nn.ReLU(),
+        nn.Linear(8, 4),
+    ).double()
 
 
 def apply(psi, u, wires):
@@ -30,94 +37,72 @@ def apply(psi, u, wires):
 
 
 def rotation(angle, p):
-    eye = torch.eye(len(p), dtype=C)
+    eye = torch.eye(len(p), dtype=torch.complex128)
     return (
         torch.cos(angle / 2)[:, None, None] * eye
         - 1j * torch.sin(angle / 2)[:, None, None] * p
     )
 
 
-def states(x, theta):
-    psi = torch.zeros((len(x), 16), dtype=C)
+def states(z):
+    psi = torch.zeros((len(z), 16), dtype=torch.complex128)
     psi[:, 0] = 1
-    pairs = list(combinations(range(4), 2))
     zz = torch.kron(Z, Z)
 
-    for layer in range(3):
+    for _ in range(3):
         for q in range(4):
             psi = apply(psi, H, (q,))
-        for q in range(4):
-            psi = apply(psi, rotation(theta[layer, q] * x[:, q], Z), (q,))
-        for k, (q1, q2) in enumerate(pairs):
-            angle = 2 * theta[layer, 4 + k] * x[:, q1] * x[:, q2]
+            psi = apply(psi, rotation(-2 * z[:, q], Z), (q,))
+        for q1, q2 in PAIRS:
+            angle = -2 * (np.pi - z[:, q1]) * (np.pi - z[:, q2])
             psi = apply(psi, rotation(angle, zz), (q1, q2))
     return psi
 
 
-def rho(psi):
-    return torch.einsum("bi,bj->ij", psi, psi.conj()) / len(psi)
+def fidelity(z1, z2):
+    psi1, psi2 = states(z1), states(z2)
+    overlap = torch.einsum("bi,bi->b", psi1.conj(), psi2)
+    return torch.abs(overlap) ** 2
 
 
-def surrogate(psi, y):
-    r0, r1 = rho(psi[y == 0]), rho(psi[y == 1])
-    p0 = torch.real(torch.trace(r0 @ r0))
-    p1 = torch.real(torch.trace(r1 @ r1))
-    cross = torch.real(torch.trace(r0 @ r1))
-    return 0.25 * (1 - p0) + 0.25 * (1 - p1) + 0.5 * cross
+def pair_loss(model, x, y, batch_size):
+    i = torch.randint(len(x), (batch_size,))
+    j = torch.randint(len(x), (batch_size,))
+    pred = fidelity(model(x[i]), model(x[j]))
+    target = (y[i] == y[j]).double()
+    return torch.mean((pred - target) ** 2)
 
 
 def optimize(args):
-    run, x, y, init_std, epochs, lr, patience, lbfgs_epochs, seed = args
+    run, x, y, iterations, batch_size, lr, seed = args
     torch.set_num_threads(1)
     torch.manual_seed(seed + run)
-    x = torch.tensor(x, dtype=R)
+    x = torch.tensor(x, dtype=torch.float64)
     y = torch.tensor(y, dtype=torch.long)
-    theta = torch.nn.Parameter(1 + init_std * torch.randn((3, 10), dtype=R))
-    opt = torch.optim.Adam([theta], lr=lr)
-    best_loss, best_theta, stale = 1e9, None, 0
+    model = network()
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
 
-    for _ in range(epochs):
+    for _ in range(iterations):
+        loss = pair_loss(model, x, y, batch_size)
         opt.zero_grad()
-        loss = surrogate(states(x, theta), y)
         loss.backward()
-        value = loss.item()
-        if value < best_loss - 1e-11:
-            best_loss = value
-            best_theta = theta.detach().clone()
-            stale = 0
-        else:
-            stale += 1
         opt.step()
-        if stale == patience:
-            break
 
-    with torch.no_grad():
-        theta.copy_(best_theta)
-
-    opt = torch.optim.LBFGS(
-        [theta],
-        max_iter=lbfgs_epochs,
-        tolerance_grad=1e-10,
-        tolerance_change=1e-12,
-        line_search_fn="strong_wolfe",
-    )
-
-    def closure():
-        opt.zero_grad()
-        loss = surrogate(states(x, theta), y)
-        loss.backward()
-        return loss
-
-    opt.step(closure)
-    theta.grad = None
-    loss = surrogate(states(x, theta), y)
+    loss = pair_loss(model, x, y, batch_size)
+    opt.zero_grad()
     loss.backward()
-    return run, theta.detach().numpy(), loss.item(), theta.grad.norm().item()
+    grad = sum(p.grad.square().sum() for p in model.parameters()).sqrt()
+    weights = [p.detach().numpy() for p in model.parameters()]
+    return run, weights, loss.item(), grad.item()
 
 
-def numpy_states(x, theta):
+def numpy_embedding(x, weights):
+    model = network()
     with torch.no_grad():
-        return states(torch.tensor(x, dtype=R), torch.tensor(theta, dtype=R)).numpy()
+        for p, value in zip(model.parameters(), weights):
+            p.copy_(torch.tensor(value))
+        z = model(torch.tensor(x, dtype=torch.float64))
+        return z.numpy(), states(z).numpy()
 
 
 def density(psi):
@@ -157,10 +142,10 @@ def gate_pool():
 
 
 def label(gate):
-    return f"{gate[0]}[w={'-'.join(map(str, gate[1]))},x={gate[2]}]"
+    return f"{gate[0]}[w={'-'.join(map(str, gate[1]))},z={gate[2]}]"
 
 
-def gamma_scores(psi, x, y, pool):
+def gamma_scores(psi, z, y, pool):
     r0, r1 = density(psi[y == 0]), density(psi[y == 1])
     delta = r1 - r0
     values, vectors = np.linalg.eigh(delta)
@@ -169,7 +154,7 @@ def gamma_scores(psi, x, y, pool):
     scores = []
 
     for _, _, feature, k in pool:
-        h = x[:, feature]
+        h = z[:, feature]
         a0 = np.einsum(
             "b,bi,bj->ij", h[y == 0], psi[y == 0], psi[y == 0].conj()
         ) / np.sum(y == 0)
@@ -181,7 +166,7 @@ def gamma_scores(psi, x, y, pool):
     return np.array(scores)
 
 
-def perturb(psi, x, gate, t):
-    h = x[:, gate[2]]
+def perturb(psi, z, gate, t):
+    h = z[:, gate[2]]
     kpsi = psi @ gate[3].T
     return np.cos(t * h)[:, None] * psi - 1j * np.sin(t * h)[:, None] * kpsi

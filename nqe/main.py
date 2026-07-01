@@ -1,5 +1,4 @@
 import multiprocessing as mp
-from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -10,81 +9,39 @@ import numpy as np
 import pandas as pd
 
 from data import load_data
-from quantum import (
-    gamma_scores,
-    gate_pool,
-    label,
-    numpy_states,
-    optimize,
-    perturb,
-    trace_distance,
-)
-
-
-DATASETS = ["mnist_01", "wine_quality_56", "wine_color"]
-N_RUNS = 100
-N_WORKERS = 16
-TRAIN_PER_CLASS = 500
-TEST_PER_CLASS = 100
-DATA_SEED = 42
-
-INIT_STD = 0.25
-ADAM_EPOCHS = 400
-ADAM_LR = 0.03
-PATIENCE = 80
-LBFGS_EPOCHS = 50
-RUN_SEED = 14200
-
-EPSILONS = [0.001, 0.003, 0.01, 0.03, 0.1]
-
-
-def log(message):
-    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
+from quantum import gamma_scores, gate_pool, label, numpy_embedding, optimize, perturb, trace_distance
+from utils import get_logger
 
 
 def run(name):
-    out = Path("results") / name
+    out = Path(__file__).parent / "results" / name
     out.mkdir(parents=True, exist_ok=True)
-    xtr, xte, ytr, yte = load_data(
-        name, TRAIN_PER_CLASS, TEST_PER_CLASS, DATA_SEED
-    )
+    xtr, xte, ytr, yte = load_data(name, N_TRAIN, N_TEST, DATA_SEED)
 
-    log(f"{name}: optimizing {N_RUNS} circuits")
-    with mp.get_context("fork").Pool(N_WORKERS) as pool:
+    logger.info(f"{name}: start {N_RUNS} NQE models")
+
+    with mp.get_context("spawn").Pool(N_WORKERS) as workers:
         fitted = []
-        for result in pool.imap_unordered(
+        for result in workers.imap_unordered(
             optimize,
             [
-                (
-                    i,
-                    xtr,
-                    ytr,
-                    INIT_STD,
-                    ADAM_EPOCHS,
-                    ADAM_LR,
-                    PATIENCE,
-                    LBFGS_EPOCHS,
-                    RUN_SEED,
-                )
+                (i, xtr, ytr, NQE_ITERATIONS, BATCH_SIZE, NQE_LR, RUN_SEED)
                 for i in range(N_RUNS)
             ],
         ):
             fitted.append(result)
-            log(
-                f"{name}: {len(fitted)}/{N_RUNS}, run={result[0]}, "
-                f"loss={result[2]:.8f}, grad={result[3]:.3e}"
-            )
+            logger.info(f"{name}: {len(fitted)}/{N_RUNS}, run={result[0]}, loss={result[2]:.8f}, grad={result[3]:.3e}")
     fitted.sort()
 
     pool = gate_pool()
     base, rows = [], []
 
-    for count, (run_id, theta, loss, grad) in enumerate(fitted, 1):
-        train_states = numpy_states(xtr, theta)
-        test_states = numpy_states(xte, theta)
+    for count, (run_id, weights, loss, grad) in enumerate(fitted, 1):
+        ztr, train_states = numpy_embedding(xtr, weights)
+        zte, test_states = numpy_embedding(xte, weights)
         t0_train = trace_distance(train_states, ytr)
         t0_test = trace_distance(test_states, yte)
-        scores = gamma_scores(train_states, xtr, ytr, pool)
+        scores = gamma_scores(train_states, ztr, ytr, pool)
 
         best = np.argmax(np.abs(scores))
         best_gate = pool[best]
@@ -129,10 +86,10 @@ def run(name):
                     gate_name = ""
                 else:
                     train_value = trace_distance(
-                        perturb(train_states, xtr, gate, epsilon * direction), ytr
+                        perturb(train_states, ztr, gate, epsilon * direction), ytr
                     )
                     test_value = trace_distance(
-                        perturb(test_states, xte, gate, epsilon * direction), yte
+                        perturb(test_states, zte, gate, epsilon * direction), yte
                     )
                     gate_name = label(gate)
 
@@ -151,13 +108,13 @@ def run(name):
                         (train_value - t0_train) / epsilon,
                     ]
                 )
-        log(f"{name}: evaluated {count}/{N_RUNS}")
+        logger.info(f"{name}: evaluated {count}/{N_RUNS}")
 
     base = pd.DataFrame(
         base,
         columns=[
             "run",
-            "surrogate_loss",
+            "nqe_loss",
             "gradient_norm",
             "train_T",
             "test_T",
@@ -256,5 +213,21 @@ def plot(name, data, out):
 
 
 if __name__ == "__main__":
+    logger = get_logger(__name__)
+
+    DATASETS = ["mnist"]  # ["mnist", "wine_quality", "wine_color"]
+    N_RUNS = 100
+    N_WORKERS = 16
+    N_TRAIN = 1000
+    N_TEST = 200
+    DATA_SEED = 42
+
+    NQE_ITERATIONS = 200
+    BATCH_SIZE = 25
+    NQE_LR = 0.01
+    RUN_SEED = 14200
+
+    EPSILONS = [0.001, 0.003, 0.01, 0.03, 0.1]
+
     for dataset in DATASETS:
         run(dataset)

@@ -16,6 +16,10 @@ env/
 
 # Results / outputs
 results/
+results_backup/
+pdf_and_backup/
+coeff/results/
+nqe/results/
 
 # PDFs
 *.pdf
